@@ -1,5 +1,3 @@
 # CloudTest
 
-This sample demostrates a problem with `CfSetInSyncState`.
-
-You need to have a folder `C:\Test\Cloud\`. Or you can change those pathes in the program.
+This sample demostrates a problem with `CfUpdatePlaceholder` partially updating a placeholder if there is not enough space on device.
