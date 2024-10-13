@@ -41,7 +41,7 @@ void CloudProviderRegistrar::RegisterWithShell(std::wstring localRoot, std::wstr
 		info.IconResource(L",0");
 		//info.IconResource(L"%SystemRoot%\\system32\\charmap.exe,0");
 
-		info.HydrationPolicy(winrt::StorageProviderHydrationPolicy::Full);
+		info.HydrationPolicy(winrt::StorageProviderHydrationPolicy::Progressive);
 		info.HydrationPolicyModifier(winrt::StorageProviderHydrationPolicyModifier::None);
 		info.PopulationPolicy(winrt::StorageProviderPopulationPolicy::AlwaysFull);
 		info.InSyncPolicy(winrt::StorageProviderInSyncPolicy::FileCreationTime | winrt::StorageProviderInSyncPolicy::DirectoryCreationTime | winrt::StorageProviderInSyncPolicy::PreserveInsyncForSyncEngine);

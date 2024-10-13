@@ -11,14 +11,15 @@
 #include <filesystem>
 #include <conio.h>
 #include <system_error>
+#include <cassert>
 
 CF_CONNECTION_KEY s_transferCallbackConnectionKey;
 HRESULT Init(std::wstring localRoot);
-HRESULT CreatePlaceHolder(_In_ std::wstring localRoot, _In_ PCWSTR parentPath, _In_ std::wstring fileName, bool inSync, _Out_ USN& usn);
+HRESULT CreatePlaceHolder(_In_ std::wstring localRoot, _In_ PCWSTR parentPath, _In_ std::wstring fileName, uint64_t size);
 void DisconnectSyncRootTransferCallbacks();
 void ConnectSyncRootTransferCallbacks(std::wstring localRoot);
-HRESULT GetUSN(LPCWSTR path, _Out_ USN& usn);
-
+void TestSimpleRead(const std::wstring& filePath);
+void TestFileMapping(const std::wstring& filePath);
 
 int main()
 {
@@ -45,53 +46,13 @@ int main()
         platformInfo.RevisionNumber << "." <<
         platformInfo.IntegrationNumber << std::endl;
 
-    USN usn;
     auto testFileName = L"test1.txt";
     auto testFile = workingDir + L"\\" + testFileName;
-    auto hr = CreatePlaceHolder(workingDir, L"", testFileName, true, usn);
+    auto hr = CreatePlaceHolder(workingDir, L"", testFileName, 128*1024*1024);
     assert(hr == S_OK);
 
-    HANDLE protectedHandle;
-    hr = CfOpenFileWithOplock(testFile.c_str(), CF_OPEN_FILE_FLAG_EXCLUSIVE, &protectedHandle);
-    assert(hr == S_OK);
-
-    {
-        uint64_t fileSize = 9999999999999;
-        CF_FILE_RANGE range = { 0 };
-        range.Length.QuadPart = fileSize;
-
-        CF_FS_METADATA meta;
-        meta.FileSize.QuadPart = fileSize;
-        meta.BasicInfo.FileAttributes = FILE_ATTRIBUTE_NORMAL;
-        meta.BasicInfo.CreationTime.QuadPart = 1;
-        meta.BasicInfo.LastWriteTime.QuadPart = 1;
-        meta.BasicInfo.LastAccessTime.QuadPart = 1;
-        meta.BasicInfo.ChangeTime.QuadPart = 1;
-
-        std::vector<uint8_t> identityStub{0, 1};
-
-        CF_UPDATE_FLAGS updateFlags = CF_UPDATE_FLAG_MARK_IN_SYNC | CF_UPDATE_FLAG_DEHYDRATE;
-
-        USN tempUSN(usn);
-        hr = CfUpdatePlaceholder(protectedHandle, &meta, identityStub.data(), (DWORD)identityStub.size(), &range, 1, updateFlags, &tempUSN, nullptr);
-        std::cout << "CfUpdatePlaceholder (with USN) for the file of size " << fileSize << " returned hresult = "
-            << std::hex << hr << " (" << std::system_category().message(hr) << ")"
-            <<", usn = " << tempUSN << std::endl;
-  
-        hr = CfUpdatePlaceholder(protectedHandle, &meta, identityStub.data(), (DWORD)identityStub.size(), &range, 1, updateFlags, nullptr, nullptr);
-        std::cout << "CfUpdatePlaceholder for the file of size " << fileSize << " returned hresult = "
-            << std::hex << hr << " (" << std::system_category().message(hr) << ")"
-            << std::endl;
-    }
-
-    CfCloseHandle(protectedHandle);
-
-    std::filesystem::file_time_type mt = std::filesystem::last_write_time(testFile);
-    std::cout << "file mtime after updating placeholder is " << std::filesystem::file_time_type::clock::to_utc(mt) << std::endl;
-
-    USN usn2;
-    GetUSN(testFile.c_str(), usn2);
-    std::cout << "file usn after updating placeholder is " << std::hex << usn2 << ", prev usn was " << usn << std::endl;
+    TestSimpleRead(testFile);
+    TestFileMapping(testFile);
 
     DisconnectSyncRootTransferCallbacks();
     CoUninitialize();
@@ -104,56 +65,69 @@ int main()
     return 0;
 }
 
-HRESULT GetUSN(LPCWSTR path, _Out_ USN& usn) {
-#define BUF_LEN 1024
-    // ...
+//
+// create a handle to file and read first 4096 bytes using ReadFile
+//
+void TestSimpleRead(const std::wstring& filePath)
+{
+    size_t numBytesToRead = 4096;
+    std::cout << "TestSimpleRead: read first " << numBytesToRead << "using ReadFile api" << std::endl;
 
-    CHAR Buffer[BUF_LEN];
-    DWORD dwBytes;
-    HANDLE hFile = INVALID_HANDLE_VALUE;
-    USN_RECORD_V2* fUsn = NULL;
-
-    hFile = CreateFile(path,
-        GENERIC_READ | GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-        NULL,
-        OPEN_EXISTING,
-        0,
-        NULL);
-
-    if (hFile == INVALID_HANDLE_VALUE)
+    auto fileHandle = CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (fileHandle == INVALID_HANDLE_VALUE)
     {
-        printf("CreateFile failed (%d)\n", GetLastError());
-        return -1;
+        // check that Antivirus is disabled, Microsoft Defender is known to cause FetchData invocation due to real-time protection option
+        assert(false);
     }
 
-    memset(Buffer, 0, BUF_LEN);
+    // the call will fail but we should see how much data was requested
+    std::vector<char> buffer(numBytesToRead);
+    DWORD bytesRead = 0;
+    auto res = ReadFile(fileHandle, buffer.data(), static_cast<DWORD>(buffer.size()), &bytesRead, nullptr);
+    assert(res == FALSE);
+    CloseHandle(fileHandle);
+    std::cout << "TestSimpleRead done\n";
+}
 
-    if (!DeviceIoControl(hFile,
-        FSCTL_READ_FILE_USN_DATA,
-        NULL,
-        0,
-        Buffer,
-        BUF_LEN,
-        &dwBytes,
-        NULL))
+//
+// create a handle to file and read first 4096 bytes using CreateFileMapping and MapViewOfFile
+//
+void TestFileMapping(const std::wstring& filePath)
+{
+    HANDLE fileHandle = INVALID_HANDLE_VALUE;
+    HANDLE fileMapping = nullptr;
+    LPVOID fileView = nullptr;
+    size_t numBytesToRead = 4096;
+
+    std::cout << "TestFileMapping: read first " << numBytesToRead << "using CreateFileMapping and MapViewOfFile api" << std::endl;
+
+    fileHandle = CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (fileHandle == INVALID_HANDLE_VALUE)
     {
-        printf("Read journal failed (%d)\n", GetLastError());
-        return -2;
+        // check that Antivirus is disabled, Microsoft Defender is known to cause FetchData invocation due to real-time protection option
+        assert(false);
     }
 
-    //printf("****************************************\n");
+    // CreateFileMapping causes full hydration no matter what
+    fileMapping = CreateFileMapping(fileHandle, nullptr, PAGE_READONLY, 0, static_cast<DWORD>(numBytesToRead), nullptr);
+    if (fileMapping == nullptr)
+        goto cleanup;
 
-    fUsn = (USN_RECORD_V2*)Buffer;
-    usn = fUsn->Usn;
-    //printf("USN: %I64x\n", fUsn->Usn);
-    //printf("File name: %.*S\n",
-    //    fUsn->FileNameLength / 2,
-    //    fUsn->FileName);
-    //printf("Reason: %x\n", fUsn->Reason);
+    fileView = MapViewOfFile(fileMapping, FILE_MAP_READ, 0, 0, numBytesToRead);
+    if (fileView == nullptr)
+        goto cleanup;
 
-    CloseHandle(hFile);
-    return S_OK;
+    // read first numBytesToRead bytes
+    for (int i = 0; i < numBytesToRead; i++)
+        std::cout << static_cast<char*>(fileView)[i];
+
+cleanup:
+    if (fileView != nullptr)
+        UnmapViewOfFile(fileView);
+    if (fileMapping != nullptr)
+        CloseHandle(fileMapping);
+    CloseHandle(fileHandle);
+    std::cout << "TestFileMapping done\n";
 }
 
 HRESULT Mount(std::wstring localRoot) {
@@ -200,32 +174,51 @@ HRESULT Init(std::wstring localRoot) {
         }
     }
 
-    // Hook up callback methods (in this class) for transferring files between client and server
     ConnectSyncRootTransferCallbacks(localRoot);
-
-
     return S_OK;
 }
 
-// This is a list of callbacks our fake provider support. This
-// class has the callback methods, which are then delegated to
-// helper classes
+static void CALLBACK OnFetchData(const CF_CALLBACK_INFO* ci, const CF_CALLBACK_PARAMETERS* cp)
+{
+    std::wcout << "OnFetchData";
+    std::wcout << " from:" << ci->ProcessInfo->ImagePath;
+    std::wcout << " offset:" << cp->FetchData.RequiredFileOffset.QuadPart;
+    std::wcout << " len:" << cp->FetchData.RequiredLength.QuadPart;
+    std::wcout << std::endl;
+
+    CF_OPERATION_INFO opInfo = { 0 };
+    CF_OPERATION_PARAMETERS opParams = { 0 };
+
+    opInfo.StructSize = sizeof(opInfo);
+    opInfo.Type = CF_OPERATION_TYPE_TRANSFER_DATA;
+    opInfo.ConnectionKey = ci->ConnectionKey;
+    opInfo.TransferKey = ci->TransferKey;
+
+#define FIELD_SIZE( type, field ) ( sizeof( ( (type*)0 )->field ) )
+#define CF_SIZE_OF_OP_PARAM( field )                                           \
+    ( FIELD_OFFSET( CF_OPERATION_PARAMETERS, field ) +                         \
+      FIELD_SIZE( CF_OPERATION_PARAMETERS, field ) )
+
+    opParams.ParamSize = CF_SIZE_OF_OP_PARAM(TransferData);
+    opParams.TransferData.CompletionStatus = S_FALSE;
+    opParams.TransferData.Buffer = nullptr;
+    opParams.TransferData.Offset = cp->FetchData.RequiredFileOffset;
+    opParams.TransferData.Length = cp->FetchData.RequiredLength;
+    auto hr = CfExecute(&opInfo, &opParams);
+    assert(hr == S_OK);
+
+#undef FIELD_SIZE
+#undef CF_SIZE_OF_OP_PARAM
+}
+
 CF_CALLBACK_REGISTRATION s_MirrorCallbackTable[] =
 {
-    //{ CF_CALLBACK_TYPE_FETCH_DATA, CloudFolder::OnFetchData_C },
-    //{ CF_CALLBACK_TYPE_CANCEL_FETCH_DATA, CloudFolder::OnCancelFetchData_C },
-
-    //{ CF_CALLBACK_TYPE_NOTIFY_DELETE_COMPLETION, CloudFolder::OnDeleteCompletion_C },
-
-    //{ CF_CALLBACK_TYPE_NOTIFY_RENAME_COMPLETION, CloudFolder::OnRenameCompletion_C },
+    { CF_CALLBACK_TYPE_FETCH_DATA, OnFetchData },
     CF_CALLBACK_REGISTRATION_END
 };
 
-// Registers the callbacks in the table at the top of this file so that the methods above
-// are called for our fake provider
 void ConnectSyncRootTransferCallbacks(std::wstring localRoot)
 {
-    // Connect to the sync root using Cloud File API
     auto hr = CfConnectSyncRoot(
         localRoot.c_str(),
         s_MirrorCallbackTable,
@@ -234,29 +227,17 @@ void ConnectSyncRootTransferCallbacks(std::wstring localRoot)
         &s_transferCallbackConnectionKey);
     if (hr != S_OK)
     {
-        // winrt::to_hresult() will eat the exception if it is a result of winrt::check_hresult,
-        // otherwise the exception will get rethrown and this method will crash out as it should
-        //LOG(LOG_LEVEL::Error, L"Could not connect to sync root, hr %08x", hr);
+        assert(false);
     }
 }
 
-
-// Unregisters the callbacks in the table at the top of this file so that 
-// the client doesn't Hindenburg
 void DisconnectSyncRootTransferCallbacks()
 {
-    //LOG(LOG_LEVEL::Info, L"Shutting down");
     auto hr = CfDisconnectSyncRoot(s_transferCallbackConnectionKey);
-
-    if (hr != S_OK)
-    {
-        // winrt::to_hresult() will eat the exception if it is a result of winrt::check_hresult,
-        // otherwise the exception will get rethrown and this method will crash out as it should
-        //LOG(LOG_LEVEL::Error, L"Could not disconnect the sync root, hr %08x", hr);
-    }
+    assert(hr == S_OK);
 }
 
-HRESULT CreatePlaceHolder(_In_ std::wstring localRoot, _In_ PCWSTR parentPath, _In_ std::wstring fileName, bool inSync, _Out_ USN& usn)
+HRESULT CreatePlaceHolder(_In_ std::wstring localRoot, _In_ PCWSTR parentPath, _In_ std::wstring fileName, uint64_t size)
 {
     std::wstring relativePath(parentPath);
     if (relativePath.size() > 0)
@@ -268,7 +249,7 @@ HRESULT CreatePlaceHolder(_In_ std::wstring localRoot, _In_ PCWSTR parentPath, _
 
     FileMetaData metadata = {};
 
-    metadata.FileSize = 0;
+    metadata.FileSize = size;
     metadata.IsDirectory = false;
 
     fileName.copy(metadata.Name, fileName.length());
@@ -279,9 +260,7 @@ HRESULT CreatePlaceHolder(_In_ std::wstring localRoot, _In_ PCWSTR parentPath, _
     cloudEntry.FileIdentityLength = sizeof(fileIdentety);
 
     cloudEntry.RelativeFileName = relativePath.data();
-    cloudEntry.Flags = inSync
-        ? CF_PLACEHOLDER_CREATE_FLAGS::CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC
-        : CF_PLACEHOLDER_CREATE_FLAGS::CF_PLACEHOLDER_CREATE_FLAG_NONE;
+    cloudEntry.Flags = CF_PLACEHOLDER_CREATE_FLAGS::CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC;
     cloudEntry.FsMetadata.FileSize.QuadPart = metadata.FileSize;
     cloudEntry.FsMetadata.BasicInfo.FileAttributes = metadata.FileAttributes;
     cloudEntry.FsMetadata.BasicInfo.CreationTime = metadata.CreationTime;
@@ -289,18 +268,8 @@ HRESULT CreatePlaceHolder(_In_ std::wstring localRoot, _In_ PCWSTR parentPath, _
     cloudEntry.FsMetadata.BasicInfo.LastAccessTime = metadata.LastAccessTime;
     cloudEntry.FsMetadata.BasicInfo.ChangeTime = metadata.ChangeTime;
 
-    if (metadata.IsDirectory)
-    {
-        cloudEntry.FsMetadata.BasicInfo.FileAttributes |= FILE_ATTRIBUTE_DIRECTORY;
-        cloudEntry.Flags |= CF_PLACEHOLDER_CREATE_FLAG_DISABLE_ON_DEMAND_POPULATION;
-        cloudEntry.FsMetadata.FileSize.QuadPart = 0;
-    }
-
     auto hr = CfCreatePlaceholders(localRoot.c_str(), &cloudEntry, 1, CF_CREATE_FLAGS::CF_CREATE_FLAG_NONE, NULL);
-    if (hr != S_OK) {
-        return hr;
-    }
+    assert(hr == S_OK);
 
-    usn = cloudEntry.CreateUsn;
     return cloudEntry.Result;
 }
